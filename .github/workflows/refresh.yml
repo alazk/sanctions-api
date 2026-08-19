@@ -1,0 +1,61 @@
+# Regenerate the wallet snapshot daily and commit it.
+#
+# On Vercel the data ships with the deployment, so "refreshing" means
+# redeploying. This job pulls the current OpenSanctions data, rewrites the
+# snapshot, and commits — which triggers a Vercel deploy automatically.
+#
+# If this workflow breaks, the API keeps answering from the last good snapshot
+# and gets quietly staler. /healthz reports ageHours and flags stale > 48h;
+# that is the only signal, so it is worth having the failure notifications on.
+
+name: Refresh sanctions snapshot
+
+on:
+  schedule:
+    # 04:20 UTC daily. Off the hour on purpose — scheduled jobs at :00 queue
+    # behind everyone else's and get delayed.
+    - cron: "20 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Regenerate snapshot
+        run: node server.mjs --write-snapshot
+
+      - name: Verify a known OFAC wallet is present
+        # The generator refuses to write fewer than 50 wallets, but "not empty"
+        # is a weaker check than "contains the address we test with". If a
+        # schema or URL change silently drops crypto wallets, this fails the
+        # job rather than committing an index that clears everything.
+        run: |
+          node -e '
+            import("./wallets-data.mjs").then(({default: s}) => {
+              const target = "0x7f367cc41522ce07553e823bf3be79a889debe1b";
+              const found = s.wallets.some(([k]) => String(k).toLowerCase() === target);
+              console.log(`${s.count} wallets, OFAC control present: ${found}`);
+              if (!found) { console.error("control address missing — refusing to commit"); process.exit(1); }
+            });
+          '
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet wallets.json wallets-data.mjs; then
+            echo "no change"
+          else
+            git add wallets.json wallets-data.mjs
+            git commit -m "Refresh sanctions snapshot ($(date -u +%Y-%m-%d))"
+            git push
+          fi
